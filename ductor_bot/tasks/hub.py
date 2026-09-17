@@ -379,6 +379,25 @@ class TaskHub:
         logger.info("Task cancel accepted id=%s name='%s'", task_id, inflight.entry.name)
         return True
 
+    async def steer(self, task_id: str, text: str) -> str:
+        """Inject *text* into a running task's CLI turn. Returns "" on success, else the reason."""
+        # 끼워넣기 패치 2026-09-17: 성공하면 TASKMEMORY.md 에 한 줄 남긴다
+        from ductor_bot.cli.claude_provider import user_message_line
+
+        inflight = self._in_flight.get(task_id)
+        if inflight is None or inflight.asyncio_task is None or inflight.asyncio_task.done():
+            return "not_running"
+        registry = self._resolve_process_registry(inflight.entry.parent_agent)
+        if registry is None:
+            return "no_process"
+        reason = await registry.steer_task(task_id, user_message_line(text).encode())
+        if not reason:
+            with contextlib.suppress(OSError), self._registry.taskmemory_path(task_id).open(
+                "a", encoding="utf-8"
+            ) as f:
+                f.write(f"\n[끼워넣음 {time.strftime('%H:%M')}] {text}\n")
+        return reason
+
     async def cancel_all(self, chat_id: int) -> int:
         """Cancel all running tasks for a chat.
 

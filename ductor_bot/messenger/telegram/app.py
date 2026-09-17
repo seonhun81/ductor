@@ -234,6 +234,7 @@ class TelegramBot:
         self._sequential.set_abort_handler(self._on_abort)
         self._sequential.set_abort_all_handler(self._on_abort_all)
         self._sequential.set_quick_command_handler(self._on_quick_command)
+        self._sequential.set_steer_handler(self._on_steer)  # 끼워넣기 패치 2026-09-17
         on_rejected = self._on_group_rejected
         auth = AuthMiddleware(allowed, allowed_group_ids=allowed_groups, on_rejected=on_rejected)
         self._router.message.outer_middleware(auth)
@@ -850,6 +851,13 @@ class TelegramBot:
             chat_id=chat_id,
             message=message,
         )
+
+    async def _on_steer(self, chat_id: int, message: Message) -> bool:
+        # 끼워넣기 패치 2026-09-17
+        if self._orchestrator is None:
+            return False
+        topic_id = get_session_key(message).topic_id
+        return await self._orchestrator.steer(chat_id, topic_id, message.text or "")
 
     async def _on_abort_all(self, chat_id: int, message: Message) -> bool:
         return await handle_abort_all(

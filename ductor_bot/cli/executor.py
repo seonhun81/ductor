@@ -23,7 +23,9 @@ from ductor_bot.cli.stream_events import ResultEvent, StreamEvent
 from ductor_bot.cli.timeout_controller import TimeoutController
 from ductor_bot.cli.types import CLIResponse, task_id_from_label
 from ductor_bot.infra.platform import CREATION_FLAGS as _CREATION_FLAGS
-from ductor_bot.infra.process_tree import force_kill_process_tree
+from ductor_bot.infra.process_tree import force_kill_process_tree, terminate_process_tree
+
+_EXIT_WAIT_SECONDS = 30  # 끼워넣기 패치 2026-09-17
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,7 @@ class SubprocessSpec:
     timeout_seconds: float | None = None
     timeout_controller: TimeoutController | None = None
     stdin_text: str | None = None
+    keep_stdin_open: bool = False  # 끼워넣기 패치 2026-09-17
 
 
 @dataclass(slots=True)
@@ -161,7 +164,12 @@ async def run_streaming_subprocess(
     # Feed stdin concurrently with the stdout read loop: a prompt larger than
     # the OS pipe buffer (~64 KiB) would otherwise deadlock against a child
     # that starts emitting stdout before draining stdin.
-    stdin_feed = asyncio.create_task(_feed_streaming_stdin(process, spec))
+    if spec.keep_stdin_open and process.stdin is not None:
+        # 끼워넣기 패치 2026-09-17: 등록 전에 첫 메시지를 버퍼에 넣어 끼워넣기보다 앞서게 한다
+        process.stdin.write((spec.stdin_text or "").encode())
+        stdin_feed = asyncio.create_task(process.stdin.drain())
+    else:
+        stdin_feed = asyncio.create_task(_feed_streaming_stdin(process, spec))
     logger.info("%s subprocess starting pid=%s", provider_label, process.pid)
 
     reg = config.process_registry
@@ -170,12 +178,33 @@ async def run_streaming_subprocess(
         if reg
         else None
     )
+    if tracked and spec.keep_stdin_open:
+        tracked.steerable = True  # 끼워넣기 패치 2026-09-17: stdin 을 열어 둔 클로드 스트리밍만
     stderr_drain = asyncio.create_task(process.stderr.read())
 
     try:
+        held: ResultEvent | None = None
         async for event in _stream_with_timeout(process, spec, line_handler):
+            if spec.keep_stdin_open and isinstance(event, ResultEvent):
+                # 끼워넣기 패치 2026-09-17: 턴이 끝나면 stdin 을 닫아 프로세스를 끝낸다.
+                # 끝나기 직전 끼워넣은 메시지는 턴을 하나 더 만들므로 result 를 모아 하나로 넘긴다.
+                if process.stdin:
+                    process.stdin.close()
+                held = merge_results(held, event)
+                continue
             yield event
-        stderr_bytes = await stderr_drain
+        if held is not None:
+            yield held
+        # 끼워넣기 패치 2026-09-17: 출력이 끝난 뒤 stderr·종료 대기에 상한을 둔다
+        stderr_bytes = b""
+        try:
+            async with asyncio.timeout(_EXIT_WAIT_SECONDS):
+                stderr_bytes = await stderr_drain
+                await process.wait()
+        except TimeoutError:
+            logger.warning("%s exit wait exceeded %ds, killing pid=%s", provider_label, _EXIT_WAIT_SECONDS, process.pid)
+            force_kill_process_tree(process.pid)
+            await process.wait()
     except TimeoutError:
         force_kill_process_tree(process.pid)
         await process.wait()
@@ -193,10 +222,11 @@ async def run_streaming_subprocess(
         with contextlib.suppress(BaseException):
             await stdin_feed
         await _cancel_drain(stderr_drain)
+        # 끼워넣기 패치 2026-09-17: 예외·취소로 빠져나와도 stdin 을 닫고 자식을 남기지 않는다
+        with contextlib.suppress(Exception):
+            await _reap_process(process)
         if tracked and reg:
             reg.unregister(tracked)
-
-    await process.wait()
 
     handler = post_handler or _default_post_handler
     async for event in handler(SubprocessResult(process=process, stderr_bytes=stderr_bytes)):
@@ -359,6 +389,60 @@ async def _feed_streaming_stdin(
         await _feed_stdin_and_close(process, spec.stdin_text)
         return
     _win_feed_stdin(process, spec.prompt)
+
+
+async def _reap_process(process: asyncio.subprocess.Process) -> None:
+    """Close stdin and terminate the child if it is still running."""
+    # 끼워넣기 패치 2026-09-17
+    if process.stdin and not process.stdin.is_closing():
+        process.stdin.close()
+    if process.returncode is not None:
+        return
+    terminate_process_tree(process.pid)
+    try:
+        async with asyncio.timeout(2):
+            await process.wait()
+    except TimeoutError:
+        force_kill_process_tree(process.pid)
+        await process.wait()
+
+
+def _add_usage(prev: dict, cur: dict) -> dict:
+    # 끼워넣기 패치 2026-09-17: 숫자는 더하고 나머지는 뒤 값
+    if not prev or not cur:
+        return cur or prev
+    out = dict(prev)
+    for key, value in cur.items():
+        old = out.get(key)
+        if isinstance(value, dict) and isinstance(old, dict):
+            out[key] = _add_usage(old, value)
+        elif (
+            isinstance(value, int | float)
+            and isinstance(old, int | float)
+            and not isinstance(value, bool)
+            and not isinstance(old, bool)
+        ):
+            out[key] = old + value
+        else:
+            out[key] = value
+    return out
+
+
+def merge_results(prev: ResultEvent | None, cur: ResultEvent) -> ResultEvent:
+    """Fold two result events of one steered turn into one."""
+    # 끼워넣기 패치 2026-09-17: 본문은 이어 붙이고, 오류는 하나라도 있으면 오류,
+    # 턴별 usage 는 합산, 세션 ID 는 마지막 값. total_cost_usd·modelUsage 는 CLI 가
+    # 프로세스 누적값으로 주므로(실측) 더하지 않고 마지막 값을 쓴다.
+    if prev is None:
+        return cur
+    cur.result = "\n\n".join(part for part in (prev.result, cur.result) if part)
+    cur.is_error = prev.is_error or cur.is_error
+    if cur.total_cost_usd is None:
+        cur.total_cost_usd = prev.total_cost_usd
+    cur.usage = _add_usage(prev.usage, cur.usage)
+    cur.model_usage = cur.model_usage or prev.model_usage
+    cur.session_id = cur.session_id or prev.session_id
+    return cur
 
 
 async def _cancel_drain(drain: asyncio.Task[bytes]) -> None:

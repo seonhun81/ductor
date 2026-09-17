@@ -177,6 +177,7 @@ class SequentialMiddleware(BaseMiddleware):
         self._abort_handler: AbortHandler | None = None
         self._abort_all_handler: AbortAllHandler | None = None
         self._quick_command_handler: QuickCommandHandler | None = None
+        self._steer_handler: AbortHandler | None = None  # 끼워넣기 패치 2026-09-17
         self._pending: dict[int, list[_QueueEntry]] = {}
         self._entry_counter = 0
         self._bot: Bot | None = None
@@ -216,6 +217,11 @@ class SequentialMiddleware(BaseMiddleware):
     def set_quick_command_handler(self, handler: QuickCommandHandler) -> None:
         """Register a callback for read-only commands dispatched *before* the lock."""
         self._quick_command_handler = handler
+
+    def set_steer_handler(self, handler: AbortHandler) -> None:
+        """Register a callback that injects a message into the running turn."""
+        # 끼워넣기 패치 2026-09-17
+        self._steer_handler = handler
 
     def get_lock(self, lock_key: tuple[int, int | None] | int) -> asyncio.Lock:
         """Return the per-session lock, creating it if needed.
@@ -375,6 +381,28 @@ class SequentialMiddleware(BaseMiddleware):
         entry: _QueueEntry | None = None
 
         if lock.locked():
+            # 끼워넣기 패치 2026-09-17: 일반 텍스트는 돌고 있는 턴에 먼저 끼워넣고, 안 되면 큐
+            # (/명령·@세션/모델 지시는 기존 큐 경로)
+            text = event.text or ""
+            if (
+                self._steer_handler
+                and text
+                and not text.startswith(("/", "@"))
+                and await self._steer_handler(chat_id, event)
+            ):
+                if self._bot:
+                    with contextlib.suppress(Exception):
+                        await self._bot.send_message(
+                            chat_id,
+                            "<i>[↪ 끼워넣음]</i>",
+                            parse_mode=ParseMode.HTML,
+                            reply_parameters=ReplyParameters(
+                                message_id=event.message_id,
+                                allow_sending_without_reply=True,
+                            ),
+                            message_thread_id=get_thread_id(event),
+                        )
+                return None
             entry = self._create_entry(chat_id, event)
             self._pending.setdefault(chat_id, []).append(entry)
             await self._send_indicator(chat_id, entry, event)

@@ -30,6 +30,7 @@ class TrackedProcess:
     label: str
     topic_id: int | None = None
     registered_at: float = field(default_factory=time.time)
+    steerable: bool = False  # 끼워넣기 패치 2026-09-17: stdin 을 열어 둔 클로드 스트리밍만 True
 
 
 class ProcessRegistry:
@@ -221,6 +222,70 @@ class ProcessRegistry:
         if count:
             logger.info("Interrupted %d CLI process(es) for chat=%d", count, chat_id)
         return count
+
+    async def steer(self, chat_id: int, topic_id: int | None, line: bytes) -> bool:
+        """Write *line* to the open stdin of the running ``main`` process.
+
+        Returns False when no such process has an open stdin (caller queues).
+        """
+        # 끼워넣기 패치 2026-09-17: esc 로 멈추는 중이면 끼워넣지 않고 큐로 보낸다
+        if chat_id in self._interrupted:
+            return False
+        for tracked in self._processes.get(chat_id, []):
+            stdin = tracked.process.stdin
+            if (
+                not tracked.steerable
+                or tracked.label != "main"
+                or tracked.topic_id != topic_id
+                or tracked.process.returncode is not None
+                or stdin is None
+                or stdin.is_closing()
+            ):
+                continue
+            try:
+                stdin.write(line)
+                await stdin.drain()
+            except (OSError, RuntimeError, ValueError):
+                return False
+            # 끼워넣기 패치 2026-09-17: drain 대기 중에 esc 가 들어왔으면 끼워넣음으로 치지 않는다
+            if chat_id in self._interrupted:
+                return False
+            logger.info("Steered message into pid=%s chat=%d", tracked.process.pid, chat_id)
+            return True
+        return False
+
+    async def steer_task(self, task_id: str, line: bytes) -> str:
+        """Write *line* to the open stdin of background task *task_id*.
+
+        Returns "" on success, otherwise the reason: no_process, stdin_closed, interrupted.
+        """
+        # 끼워넣기 패치 2026-09-17: 배경작업용. 텔레그램 steer 는 main 만 대상으로 그대로 둔다
+        label = f"task:{task_id}"
+        tracked = next(
+            (
+                t
+                for entries in self._processes.values()
+                for t in entries
+                if t.label == label and t.process.returncode is None
+            ),
+            None,
+        )
+        if tracked is None:
+            return "no_process"
+        if tracked.chat_id in self._interrupted:
+            return "interrupted"
+        stdin = tracked.process.stdin
+        if not tracked.steerable or stdin is None or stdin.is_closing():
+            return "stdin_closed"
+        try:
+            stdin.write(line)
+            await stdin.drain()
+        except (OSError, RuntimeError, ValueError):
+            return "stdin_closed"
+        if tracked.chat_id in self._interrupted:
+            return "interrupted"
+        logger.info("Steered message into task=%s pid=%s", task_id, tracked.process.pid)
+        return ""
 
     async def kill_stale(self, max_age_seconds: float) -> int:
         """Kill processes older than *max_age_seconds* (wall-clock). Returns count killed."""

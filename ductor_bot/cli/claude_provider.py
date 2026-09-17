@@ -23,6 +23,7 @@ from ductor_bot.cli.base import (
 from ductor_bot.cli.executor import SubprocessSpec, run_oneshot_subprocess, run_streaming_subprocess
 from ductor_bot.cli.gemini_utils import create_system_prompt_file
 from ductor_bot.cli.stream_events import (
+    ResultEvent,
     StreamEvent,
     parse_stream_line,
 )
@@ -118,6 +119,11 @@ class ClaudeCodeCLI(BaseCLI):
         timeout_controller: TimeoutController | None = None,
     ) -> CLIResponse:
         """Send a prompt and return the final result."""
+        # 끼워넣기 패치 2026-09-17: POSIX 는 비스트리밍도 stream-json 으로 띄워 끼워넣기를 받고 답은 한 번에 돌려준다
+        if not _IS_WINDOWS and not self._config.docker_container:
+            return await self._send_collected(
+                prompt, resume_session, continue_session, timeout_seconds, timeout_controller
+            )
         append_file = self._create_append_prompt_path()
         try:
             cmd = self._build_command(
@@ -136,6 +142,54 @@ class ClaudeCodeCLI(BaseCLI):
             )
         finally:
             await _cleanup_file(append_file)
+
+    async def _send_collected(
+        self,
+        prompt: str,
+        resume_session: str | None,
+        continue_session: bool,
+        timeout_seconds: float | None,
+        timeout_controller: TimeoutController | None,
+    ) -> CLIResponse:
+        """Run ``send_streaming`` and fold its result events into one CLIResponse."""
+        # 끼워넣기 패치 2026-09-17: 끼워넣은 턴은 executor 가 result 하나로 합쳐 준다.
+        # returncode 가 채워진 result 는 CLI 가 아니라 executor 의 비정상 종료 알림이다.
+        final: ResultEvent | None = None
+        exit_error: ResultEvent | None = None
+        async for event in self.send_streaming(
+            prompt, resume_session, continue_session, timeout_seconds, timeout_controller
+        ):
+            if not isinstance(event, ResultEvent):
+                continue
+            if event.returncode is not None:
+                exit_error = event
+            else:
+                final = event
+
+        if final is not None and final.is_error and final.result.startswith("__TIMEOUT__"):
+            return CLIResponse(result="", is_error=True, timed_out=True)
+        stderr_text = exit_error.result if exit_error else ""
+        returncode = exit_error.returncode if exit_error else 0
+        if final is None:
+            logger.error("CLI returned no result (exit=%s)", returncode)
+            return CLIResponse(
+                result=stderr_text.strip(), is_error=True, returncode=returncode, stderr=stderr_text
+            )
+        response = CLIResponse(
+            session_id=final.session_id,
+            result=final.result,
+            is_error=final.is_error,
+            returncode=returncode,
+            stderr=stderr_text,
+            duration_ms=final.duration_ms,
+            duration_api_ms=final.duration_api_ms,
+            num_turns=final.num_turns,
+            total_cost_usd=final.total_cost_usd,
+            usage=final.usage,
+            model_usage=final.model_usage,
+        )
+        _log_response(response)
+        return response
 
     def _build_command_streaming(
         self,
@@ -156,6 +210,10 @@ class ClaudeCodeCLI(BaseCLI):
             pass
         if "--verbose" not in cmd:
             cmd.insert(1, "--verbose")
+        # 끼워넣기 패치 2026-09-17: POSIX 는 프롬프트를 argv 대신 stdin stream-json 으로 보낸다
+        if not _IS_WINDOWS:
+            del cmd[-2:]
+            cmd += ["--input-format", "stream-json"]
         return cmd
 
     async def send_streaming(
@@ -175,12 +233,17 @@ class ClaudeCodeCLI(BaseCLI):
                 continue_session,
                 append_prompt_file=self._append_arg_path(append_file),
             )
-            exec_cmd, use_cwd = docker_wrap(cmd, self._config, interactive=_IS_WINDOWS)
+            exec_cmd, use_cwd = docker_wrap(cmd, self._config, interactive=True)
             _log_cmd(exec_cmd, streaming=True)
+            # 끼워넣기 패치 2026-09-17: 첫 메시지를 stdin 으로 보내고 열어 둔다
+            spec = SubprocessSpec(exec_cmd, use_cwd, prompt, timeout_seconds, timeout_controller)
+            if not _IS_WINDOWS:
+                spec.stdin_text = user_message_line(prompt)
+                spec.keep_stdin_open = True
 
             async for event in run_streaming_subprocess(
                 config=self._config,
-                spec=SubprocessSpec(exec_cmd, use_cwd, prompt, timeout_seconds, timeout_controller),
+                spec=spec,
                 line_handler=_claude_line_handler,
                 provider_label="CLI",
             ):
@@ -216,6 +279,13 @@ class ClaudeCodeCLI(BaseCLI):
             msg = f"append-system-prompt temp file is outside the Docker mount: {host_path}"
             raise RuntimeError(msg)
         return container_path
+
+
+def user_message_line(text: str) -> str:
+    """One ``--input-format stream-json`` user message line."""
+    # 끼워넣기 패치 2026-09-17
+    msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+    return json.dumps(msg, ensure_ascii=False) + "\n"
 
 
 async def _claude_line_handler(line: str) -> AsyncGenerator[StreamEvent, None]:
@@ -265,7 +335,11 @@ def _parse_response(stdout: bytes, stderr: bytes, returncode: int | None) -> CLI
         usage=data.get("usage", {}),
         model_usage=data.get("modelUsage", {}),
     )
+    _log_response(response)
+    return response
 
+
+def _log_response(response: CLIResponse) -> None:
     if response.is_error:
         logger.error("CLI error: %s", response.result[:200])
     else:
@@ -277,5 +351,3 @@ def _parse_response(stdout: bytes, stderr: bytes, returncode: int | None) -> CLI
             response.total_tokens,
             response.duration_ms or 0,
         )
-
-    return response

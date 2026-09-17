@@ -84,6 +84,7 @@ class InternalAgentAPI:
         self._app.router.add_get("/tasks/list", self._handle_task_list)
         self._app.router.add_post("/tasks/cancel", self._handle_task_cancel)
         self._app.router.add_post("/tasks/delete", self._handle_task_delete)
+        self._app.router.add_post("/tasks/steer", self._handle_task_steer)  # 끼워넣기 패치 2026-09-17
 
         self._runner: web.AppRunner | None = None
 
@@ -437,6 +438,40 @@ class InternalAgentAPI:
             cancelled,
         )
         return web.json_response({"success": cancelled})
+
+    async def _handle_task_steer(self, request: web.Request) -> web.Response:
+        """POST /tasks/steer — inject a message into a running task's CLI turn."""
+        # 끼워넣기 패치 2026-09-17
+        if self._task_hub is None:
+            return web.json_response(
+                {"success": False, "error": "Task system not available"},
+                status=503,
+            )
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"success": False, "error": "Invalid JSON body"},
+                status=400,
+            )
+        task_id = data.get("task_id", "")
+        text = data.get("prompt", "")
+        sender = data.get("from", "")
+        # 끼워넣기 패치 2026-09-17: from 은 필수, 소유자만 끼워넣는다
+        if not task_id or not text or not sender:
+            return web.json_response(
+                {"success": False, "error": "Missing 'task_id', 'prompt' or 'from' field"},
+                status=400,
+            )
+        entry = self._task_hub.registry.get(task_id)
+        if entry is not None and entry.parent_agent != sender:
+            return web.json_response(
+                {"success": False, "error": "Not authorized to steer this task"},
+                status=403,
+            )
+        reason = await self._task_hub.steer(task_id, text)
+        logger.info("Task steer via API id=%s from=%s result=%s", task_id, sender or "?", reason or "ok")
+        return web.json_response({"success": not reason, **({"error": reason} if reason else {})})
 
     async def _handle_task_delete(  # noqa: PLR0911
         self, request: web.Request

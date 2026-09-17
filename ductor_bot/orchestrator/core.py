@@ -540,6 +540,14 @@ class Orchestrator:
         """
         return self._process_registry.interrupt_all(chat_id)
 
+    async def steer(self, chat_id: int, topic_id: int | None, text: str) -> bool:
+        """Inject *text* into the running CLI turn. False means: queue it instead."""
+        # 끼워넣기 패치 2026-09-17
+        from ductor_bot.cli.claude_provider import user_message_line
+
+        line = user_message_line(text).encode()
+        return await self._process_registry.steer(chat_id, topic_id, line)
+
     async def abort_all(self) -> int:
         """Kill all active CLI processes across all chats on this agent."""
         return await self._process_registry.kill_all_active()
